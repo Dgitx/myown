@@ -1,6 +1,6 @@
 // All-in-one Cloudflare Worker: serves the player page, playlist, TV guide and icon from ONE address,
 // with server-side protection. Optional settings (Worker > Settings > Variables and Secrets):
-//   SITE_USER + SITE_PASS  secrets: require a login (HTTP Basic) before anything is served
+//   AUTH_KV  variable: KV namespace for username/password lookup
 //   PLAYLIST_URL, EPG_URL  secrets: keep the real upstream addresses out of this code
 const UPSTREAM = "https://tivimate.viulk.xyz/channels.m3u";
 const EPG_UPSTREAM = "https://tivi.viulk.xyz/metadata/epg.xml";
@@ -20,19 +20,25 @@ const SECURITY = {
 };
 
 // Test run only: shows in the browser console as "[Report Only] Refused to...", blocks nothing.
-const STRICT_REPORT = "default-src 'none'; script-src 'self' 'unsafe-inline' https://content.jwplatform.com https://*.jwpcdn.com https://*.jwplayer.com https://*.jwplatform.com; style-src 'self' 'unsafe-inline' https://*.jwpcdn.com https://*.jwplatform.com; img-src https: data: blob:; media-src https: blob:; connect-src 'self' https:; worker-src blob:; font-src https: data:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+const STRICT_REPORT = "default-src 'none'; script-src 'self' 'unsafe-inline' https://content.jwplatform.com https://*.jwpcdn.com https://*.jwplayer.com https://*.jwplatform.com; style-src 'self' '[...]
 
 function safeEqual(a, b) {
   let r = a.length ^ b.length;
   for (let i = 0; i < Math.max(a.length, b.length); i++) r |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
   return r === 0;
 }
-function authorized(request, env) {
-  if (!env.SITE_USER || !env.SITE_PASS) return true;
+async function authorized(request, env) {
+  if (!env.AUTH_KV) return true;
   const h = request.headers.get("Authorization") || "";
   if (h.slice(0, 6) !== "Basic ") return false;
   let given; try { given = atob(h.slice(6)); } catch (e) { return false; }
-  return safeEqual(given, env.SITE_USER + ":" + env.SITE_PASS);
+  const [username, password] = given.split(":");
+  if (!username || !password) return false;
+  try {
+    const storedPassword = await env.AUTH_KV.get(username);
+    if (!storedPassword) return false;
+    return safeEqual(password, storedPassword);
+  } catch (e) { return false; }
 }
 // Data routes only answer our own page's requests, not a browser tab opened on the address or another website.
 function fromOurPage(request) {
@@ -92,7 +98,7 @@ export default {
 
     const locked = lockedFor("fail:" + ip, 5);          // 5 wrong passwords in 10 minutes = locked out for the rest of the window
     if (locked) return tooMany(locked);
-    if (!authorized(request, env)) {
+    if (!await authorized(request, env)) {
       if (request.headers.get("Authorization")) bump("fail:" + ip, 10 * 60e3);
       return new Response("Login required", { status: 401, headers: { ...SECURITY, "WWW-Authenticate": 'Basic realm="Private", charset="UTF-8"', "Cache-Control": "no-store" } });
     }
