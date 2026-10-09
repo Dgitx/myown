@@ -1,6 +1,6 @@
 // All-in-one Cloudflare Worker: serves the player page, playlist, TV guide and icon from ONE address,
 // with server-side protection. Optional settings (Worker > Settings > Variables and Secrets):
-//   AUTH_TOKEN_KV  variable: name of the KV namespace to check auth tokens
+//   AUTH_KV  variable: name of the KV namespace to check credentials
 //   PLAYLIST_URL, EPG_URL  secrets: keep the real upstream addresses out of this code
 const UPSTREAM = "https://tivimate.viulk.xyz/channels.m3u";
 const EPG_UPSTREAM = "https://tivi.viulk.xyz/metadata/epg.xml";
@@ -30,35 +30,31 @@ function safeEqual(a, b) {
   return r === 0;
 }
 
-// Cloudflare KV-based authorization
+// Cloudflare KV-based authorization with username/password
 async function authorizedByKV(request, env) {
   // If no KV namespace is configured, allow all requests
   if (!env.AUTH_KV) return true;
   
   const authHeader = request.headers.get("Authorization") || "";
-  if (!authHeader.startsWith("Bearer ")) return false;
+  if (!authHeader.startsWith("Basic ")) return false;
   
-  const token = authHeader.slice(7); // Remove "Bearer " prefix
-  if (!token) return false;
+  let credentials;
+  try {
+    credentials = atob(authHeader.slice(6));
+  } catch (e) {
+    return false;
+  }
+  
+  const [username, password] = credentials.split(":");
+  if (!username || !password) return false;
   
   try {
-    // Check if token exists in KV and is not expired
-    const tokenData = await env.AUTH_KV.get(token, "json");
-    if (!tokenData) return false;
+    // Look up the username in KV
+    const storedPassword = await env.AUTH_KV.get(username);
+    if (!storedPassword) return false;
     
-    // Check expiration if present
-    if (tokenData.expires && Date.now() > tokenData.expires) {
-      await env.AUTH_KV.delete(token);
-      return false;
-    }
-    
-    // Mark last used time
-    if (tokenData.trackUsage) {
-      tokenData.lastUsed = new Date().toISOString();
-      await env.AUTH_KV.put(token, JSON.stringify(tokenData));
-    }
-    
-    return true;
+    // Compare passwords safely
+    return safeEqual(password, storedPassword);
   } catch (e) {
     console.error("KV auth check failed:", e);
     return false;
@@ -121,11 +117,11 @@ export default {
     if (request.method !== "GET" && request.method !== "HEAD") return new Response("Method not allowed", { status: 405 });
     if (url.pathname === "/robots.txt") return new Response("User-agent: *\nDisallow: /\n", { headers: { "Content-Type": "text/plain" } });
 
-    const locked = lockedFor("fail:" + ip, 5);          // 5 wrong tokens in 10 minutes = locked out for the rest of the window
+    const locked = lockedFor("fail:" + ip, 5);          // 5 wrong passwords in 10 minutes = locked out for the rest of the window
     if (locked) return tooMany(locked);
     if (!(await authorizedByKV(request, env))) {
       if (request.headers.get("Authorization")) bump("fail:" + ip, 10 * 60e3);
-      return new Response("Unauthorized", { status: 401, headers: { ...SECURITY, "WWW-Authenticate": 'Bearer realm="Private"', "Cache-Control": "no-store" } });
+      return new Response("Login required", { status: 401, headers: { ...SECURITY, "WWW-Authenticate": 'Basic realm="Private", charset="UTF-8"', "Cache-Control": "no-store" } });
     }
     if (request.headers.get("Authorization")) hits.delete("fail:" + ip);
 
